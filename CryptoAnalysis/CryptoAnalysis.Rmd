@@ -1,0 +1,546 @@
+---
+title: "Behavior Analysis and Prediction of Cryptocurrencies"
+author: "Shyam Sudhakaran"
+date: "November 30, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#Regression and Cluster analysis on Stock/Cryptocurrency data
+We want to see if we can use autoregression to guess whether a series will rise or fall. We also want to use an experimental technique using k-means to determine whether a series is a stock & cryptocurrency based on an estimate of volatility(standard deviation in this case)
+
+<br>
+libraries
+```{r}
+library(dplyr) #manipulation functions for dataframes
+library(ggplot2) #allows for cool plots
+library(stats)  #general stats
+library(tidyquant) #get tq_mutate function
+```
+
+
+read in crypto-currency data
+```{r}
+file_names <- list.files("/home/shyam/Desktop/USF/fall2017/bs100/Intro-Data-Science/FinalProject/crypto")
+dirname <- "/home/shyam/Desktop/USF/fall2017/bs100/Intro-Data-Science/FinalProject/crypto"
+
+#read all csvs in a directory
+read_csvs <- function(directory){
+  file_names <- list.files(directory)
+  filepaths <- list()
+  for(i in 1:length(file_names)) {
+    filepath <- paste0(directory,"/",file_names[i])
+    print(filepath)#plot the actual test data vs the predicted, although it doesn't seem like much, it seems to capture the direction very well
+
+    data <- read.csv(file=filepath, header=TRUE, sep=",",stringsAsFactors=FALSE)
+    filepaths[[i]] <- data
+  }
+  return(filepaths)
+}
+
+currencies <- read_csvs(dirname) #list of dataframes of currencies
+names(currencies) <- file_names
+
+```
+
+manipulate the data and put it in a nice format, calculate logreturn
+```{r}
+
+get_data_interval <- function(li,interval){ #get a year's worth of data
+  for(i in 1:length(li)){
+    li[[i]] <- li[[i]][1:365,]
+  }
+  return(li)
+}
+
+#add date column and log return
+create_date_object <- function(x,logret){ #fix date column and calculate logreturns
+  things <- as.tibble(x)
+  things[,1] <- sapply(things[,1],function(x) gsub(" ","/",x))
+  things[,1] <- sapply(things[,1], function(x) gsub(",","",x))
+  things[,1] <- as.Date(things$Date, "%b/%d/%Y")
+  if(logret == TRUE) {
+    things <- things %>% tq_mutate(select = Close,
+                                           mutate_fun = periodReturn,
+                                           period     = "daily",
+                                           type       = "log",
+                                           col_rename = "logreturns")
+  }
+  return(things)
+}
+
+file_names_stocks <- list.files("/home/shyam/Desktop/USF/fall2017/bs100/Intro-Data-Science/FinalProject/stocks")
+dirname <- "/home/shyam/Desktop/USF/fall2017/bs100/Intro-Data-Science/FinalProject/stocks"
+
+stocks <- read_csvs(dirname) #list of dataframes of currencies
+names(stocks) <- file_names_stocks 
+newstocks <- get_data_interval(stocks,365) 
+
+listofstocks <- list()
+for(o in 1:length(newstocks)) {
+  stockstuff <- newstocks[[o]]
+  stockstuff$X <- NULL
+  stockstuff$date <- as.Date(stockstuff$date)
+  stockstuff <- na.omit(stockstuff)
+  stockstuff <- stockstuff %>% tq_mutate(select     = close,
+                                             mutate_fun = periodReturn,
+                                             period     = "daily",
+                                             type       = "log",
+                                             col_rename = "logreturns")
+  listofstocks[[length(listofstocks)+1]] <- stockstuff
+}
+file_names_stocks
+names(listofstocks) <- file_names_stocks
+fullnames <- c()
+
+cvs <- listofstocks[[3]]
+
+ggplot(data = cvs, aes(cvs$date)) + geom_line(aes(y=cvs$close,color="closeprices")) + ggtitle("CVS close prices") + xlab("Date") + ylab("close prices")
+
+ggplot(data = cvs, aes(cvs$date)) + geom_line(aes(y=cvs$logreturns,color="logreturns")) + ggtitle("CVS logreturns") + xlab("Date") + ylab("logreturns")
+
+newdataset <- get_data_interval(currencies,365) 
+bitcoin <- create_date_object(newdataset$bitcoin_price.csv,TRUE)
+ggplot(data = bitcoin, aes(bitcoin$Date)) + geom_line(aes(y=bitcoin$Close,color="Close")) + ggtitle("Bitcoin close") + xlab("Date") + ylab("logreturns")
+
+ggplot(data = bitcoin, aes(bitcoin$Date)) + geom_line(aes(y=bitcoin$logreturns,color="logreturns")) + ggtitle("Bitcoin logreturns") + xlab("Date") + ylab("logreturns")
+
+
+```
+
+###Cross Validation
+We split the data into a training set and test set, training consisting of 270 days and the rest as test
+```{r}
+trainbitcoin <- bitcoin[1:270,]
+testbitcoin <- bitcoin[271:365,]
+traincvs <- cvs[1:270,]
+testsetcvs <- cvs[271:365,]
+```
+
+###Coefficient matrix
+this matrix is used to find the least square estimates of the autoregressive model, approximating the autocorrelation
+```{r}
+create_coefficient <- function(l,y) {
+  n <- length(y)
+  coefficient <- matrix(0,nrow=n,ncol=l) #initialize matrix of zeroes
+  i <- l+1
+  y <- rev(y) #reverse so most recent is first
+  while(i <= n) {
+    j <- 1
+    param <- i-l+1 #starts with 2nd value
+    while(j <= l) {
+      coefficient[i,j] <- as.numeric(y[param]) #adds incrementally
+      j <-  j+1
+      param <- param + 1
+    }
+    i <- i+1
+  }
+  return(list(coefficient[(l+1):n,],y[1:(n-l)])) #returns the matrix values and also the response variable at the relevant indices
+}
+
+```
+
+
+```{r}
+#solves Ax = b, A is the coefficient matrix, b is the bitcoin logreturns
+solve_least_squares <- function(A,b) {
+    x <- solve(t(A) %*% A) %*% (t(A)%*%b)
+    return(x)
+}
+```
+
+##Prediction
+```{r}
+#predict values
+get_values <- function(weights,y,testy) {
+  lag <- length(weights)
+  n <- length(y)
+  len <- nrow(testy)
+  d <- y[(n-(lag-1)):n]
+    for(i in 1:len) {
+      vec <- d[i:length(d)]
+      value <- rev(vec)%*%weights #reverse to use the most recent values, dot with the weights
+      d <- c(d,value)
+    }
+  d <- d[(lag+1):length(d)]
+  return(d)
+}
+testbit <- testbitcoin[1:length(testbitcoin$logreturns),]
+testcvs <- cvs[1:length(cvs$logreturns),]
+
+```
+
+###Analyze
+initially, we will try to actually predict the returns of the values and find a series that looks somewhat close to the test set. We will find that in fact the rmse is relatively large compared to other lag values and its decision rate(whether it guesses positive or negative and gets it right based on the test set) is rather small. We will pick 60 because it seems to match the test data, however it is actually not a good model. It is misleading because it actually has a relatively high rmse
+####Bitcoin
+```{r}
+vandbitcoin <- create_coefficient(60,trainbitcoin$logreturns) #bitcoin coefficient
+solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+lagvalues <- get_values(solution,trainbitcoin$logreturns,testbit)
+
+#Although it doesn't really predict the actual return, the direction of each point is all we care about, that is if at a point lagvalues * testbit$logreturns > 0
+ggplot(data = testbit, aes(testbit$Date)) + geom_line(aes(y=testbit$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("Bitcoin logreturns at lag 60") + xlab("Date") + ylab("logreturns")
+
+
+x <- testbit$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+print(probtorise) #low prob
+rmse <- (sum((testbit$logreturns - lagvalues)^2)/length(lagvalues))^1/2
+print(rmse) #high rmse
+```
+####CVS
+We do the same with cvs and it will share the same results
+```{r}
+vandcvs <- create_coefficient(60,traincvs$logreturns) #cvs coefficient
+solution <- solve_least_squares(vandcvs[[1]],vandcvs[[2]]) #solves
+lagvalues <- get_values(solution,traincvs$logreturns,testsetcvs)
+
+#Although it doesn't really predict the actual return, the direction of each point is all we care about, that is if at a point lagvalues * testsetcvs$logreturns > 0
+ggplot(data = testsetcvs, aes(testsetcvs$date)) + geom_line(aes(y=testsetcvs$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("CVS logreturns at lag 60") + xlab("Date") + ylab("logreturns")
+
+
+
+x <- testbit$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+print(probtorise) #low prob
+rmse <- (sum((testbit$logreturns - lagvalues)^2)/length(lagvalues))^1/2
+print(rmse) #high rmse
+```
+<br>
+here we will find the best amount of lag for the autoregressive model using rmse or just the raw probability and we'll analyze the prediction
+####BITCOIN
+```{r}
+rmsevec <- c()#vector of rmses
+for(p in 1:100) {
+  vandbitcoin <- create_coefficient(p,trainbitcoin$logreturns) #bitcoin coefficient
+  solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+  lagvalues <- get_values(solution,trainbitcoin$logreturns,testbit)
+  rmse <- (sum((testbit$logreturns - lagvalues)^2)/length(lagvalues))^1/2
+  rmsevec <- c(rmsevec,rmse)
+}
+plot(rmsevec,main = "Bitcoin rmse",xlab = "Lag",ylab = "rmse") #we can see as the lag increases, the rmse increases as well
+minrmse <- which(rmsevec==min(rmsevec))
+print(minrmse) #lag with smallest rmse 
+print(min(rmsevec))
+
+vandbitcoin <- create_coefficient(minrmse,trainbitcoin$logreturns) #bitcoin coefficient
+solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+lagvalues <- get_values(solution,trainbitcoin$logreturns,testbit)
+
+#Although it doesn't really predict the actual return, the direction of each point is all we care about, that is if at a point lagvalues * testbit$logreturns > 0
+ggplot(data = testbit, aes(testbit$Date)) + geom_line(aes(y=testbit$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("Bitcoin model with lowest RMSE") + xlab("Date") + ylab("logreturns")
+
+
+#find if our prediction was right about direction(predicted outcome was positive or negative and the test data was also positive or negative for a predicted value)
+x <- testbit$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+print(probtorise) #probability
+```
+####CVS
+We can see with cvs similarly the model with the lowest rmse doesn't fit the data too well because logreturns are inheritly volatile
+```{r}
+rmsevec <- c()#vector of rmses
+for(p in 1:100) {
+  vandbitcoin <- create_coefficient(p,traincvs$logreturns) #cvs coefficient
+  solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+  lagvalues <- get_values(solution,traincvs$logreturns,testsetcvs)
+  rmse <- (sum((testsetcvs$logreturns - lagvalues)^2)/length(lagvalues))^1/2
+  rmsevec <- c(rmsevec,rmse)
+}
+plot(rmsevec,main = "CVS rmses",xlab = "Lag",ylab = "rmse") #we can see as the lag increases, the rmse increases as well, and reaches its lowest at around ~25
+minrmse <- which(rmsevec==min(rmsevec))
+print(minrmse) #lag with smallest rmse 
+print(min(rmsevec))
+
+vandbitcoin <- create_coefficient(minrmse,traincvs$logreturns) #cvs coefficient
+solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+lagvalues <- get_values(solution,traincvs$logreturns,testsetcvs)
+
+#Although it doesn't really predict the actual return, the direction of each point is all we care about, that is if at a point lagvalues * testbit$logreturns > 0
+ggplot(data = testsetcvs, aes(testsetcvs$date)) + geom_line(aes(y=testsetcvs$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("CVS model with lowest RMSE") + xlab("Date") + ylab("logreturns")
+
+#find if our prediction was right about direction(predicted outcome was positive or negative and the test data was also positive or negative for a predicted value)
+x <- testsetcvs$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+print(probtorise) #probability
+```
+We can see that the model with the lowest rmse doesn't actually have the highest correct guess rate
+
+This demonstrates that it's actually better to try to predict direction rather than actual returns, because of the inherit randomness of the magnitude of the returns, as we could see in both the graphs.
+###Find raw probability of rising or falling
+####Bitcoin
+```{r}
+testbit <- testbitcoin[1:length(testbitcoin$logreturns),] 
+prob <- c()#vector of probabilities
+for(p in 1:100) {
+  vandbitcoin <- create_coefficient(p,trainbitcoin$logreturns) #bitcoin coefficient
+  solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+  lagvalues <- get_values(solution,trainbitcoin$logreturns,testbit)
+  x <- testbit$logreturns * lagvalues
+  newx <- x[x > 0]
+  prob <- c(prob,(length(newx)/length(x)))
+}
+plot(prob,main = "Bitcoin probabilities",xlab = "Lag",ylab = "probabilities")#we can see that as lag increases, the probability decreases
+maxprob <- which(prob == max(prob)) #index
+print(maxprob) #lag with highest guess rate
+
+vandbitcoin <- create_coefficient(maxprob,trainbitcoin$logreturns) #bitcoin coefficient
+solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+lagvalues <- get_values(solution,trainbitcoin$logreturns,testbit)
+
+#plot the actual test data vs the predicted, although it doesn't seem like much, it seems to capture the direction very well
+ggplot(data = testbit, aes(testbit$Date)) + geom_line(aes(y=testbit$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("Bitcoin model with highest probability") + xlab("Date") + ylab("logreturns")
+
+x <- testbit$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+
+print(probtorise)
+
+```
+The percentage of correct guesses is actually pretty high, so that's why its better to just try to predict direction. Now we will see how accurate we can get with a more stable series, CVS
+####CVS
+```{r}
+testbit <- testsetcvs[1:length(testsetcvs$logreturns),] 
+prob <- c()#vector of probabilities
+for(p in 1:100) {
+  vandbitcoin <- create_coefficient(p,traincvs$logreturns) #bitcoin coefficient
+  solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+  lagvalues <- get_values(solution,traincvs$logreturns,testbit)
+  x <- testbit$logreturns * lagvalues
+  newx <- x[x > 0]
+  prob <- c(prob,(length(newx)/length(x)))
+}
+plot(prob,main = "CVS probabilities",xlab = "Lag",ylab = "probabilities") #we can see that as lag increases, the probability decreases
+maxprob <- which(prob == max(prob)) #index
+print(maxprob) #lag with highest guess rate
+
+vandbitcoin <- create_coefficient(maxprob,traincvs$logreturns) #bitcoin coefficient
+solution <- solve_least_squares(vandbitcoin[[1]],vandbitcoin[[2]]) #solves
+lagvalues <- get_values(solution,traincvs$logreturns,testbit)
+
+#plot the actual test data vs the predicted, although it doesn't seem like much, it seems to capture the direction very well
+ggplot(data = testbit, aes(testbit$date)) + geom_line(aes(y=testbit$logreturns,color="test")) + geom_line(aes(y=lagvalues,color="lag")) + ggtitle("CVS model with highest probability") + xlab("Date") + ylab("logreturns")
+
+x <- testbit$logreturns * lagvalues
+newx <- x[x > 0]
+probtorise <- length(newx)/length(x) 
+
+print(probtorise)
+
+```
+60% of our guesses are right for direction! This really demonstrates how a stable stock like cvs is way easier to predict than bitcoin
+
+
+##Clustering to determine whether a series is more likely a stock or a cryptocurrency
+We will compare different standard deviation values of returns to guess whether it is a stock or a cryptocurrency, assuming that cryptocurrencies are more volatile and thus will have higher standard deviation values
+<br>
+get data for the clustering:
+```{r}
+
+
+bitcoin <- create_date_object(newdataset$bitcoin_price.csv,TRUE)
+fullnames <- c(fullnames,"bitcoin")
+curframe <- data.frame(bitcoin$logreturns)
+ripple <- create_date_object(newdataset$ripple_price.csv,TRUE)
+fullnames <- c(fullnames,"ripple")
+curframe <- cbind(curframe,ripple$logreturns)
+
+neo <- create_date_object(newdataset$neo_price.csv,TRUE)
+fullnames <- c(fullnames,"neo")
+
+curframe <- cbind(curframe,neo$logreturns)
+dash <- create_date_object(newdataset$dash_price.csv,TRUE)
+fullnames <- c(fullnames,"dash")
+
+curframe <- cbind(curframe,dash$logreturns)
+waves <- create_date_object(newdataset$ethereum_classic_price.csv,TRUE)
+fullnames <- c(fullnames,"ethereumclassic")
+
+curframe <- cbind(curframe,waves$logreturns)
+etherium <- create_date_object(newdataset$ethereum_price.csv,TRUE)
+fullnames <- c(fullnames,"etherium")
+
+curframe <- cbind(curframe,etherium$logreturns)
+for(new in 1:length(listofstocks)) {
+  curframe <- cbind(curframe,listofstocks[[new]]$logreturns)
+}
+fullnames <- c(fullnames,file_names_stocks)
+
+curframe <- apply(curframe,2,exp) #convert to actual returns
+curframe <- (curframe - 1)*100 #convert to actual returns
+standarddevs <- apply(curframe,2,sd)
+names(standarddevs) <- fullnames
+
+```
+
+###K-means algorithm
+We will use k = 2 because we are only trying to find whether the series is a stock or a currency
+```{r}
+k_means <- function(frame,k,minimum,maximum) { #takes in a dataframe, number of centers, minimum value and max value
+  clusters <- list() #initialize cluster list
+  n <- ncol(frame) #number of values
+  dim <- length(frame[,1])
+  #initialize centers
+  for(i in 1:k) {
+    clusters[[i]] <- list()
+    clusters[[i]][[1]] <- runif(dim,min=minimum,max = maximum) #picks points from uniform distribution
+    clusters[[i]][[2]] <- c(0) #initialize vector of points indices
+    clusters[[i]][[3]] <- list() #initialize the list of series
+  }
+  
+  check <- TRUE #determines whether to terminate
+  clusterindices <- list()
+  for(u in 1:k) {
+    clusterindices[[u]] <- c(1) #intialize list to check
+  }
+  count <- 1
+  while(check == TRUE) {
+  numcheck <- 0
+  for(clusts in 1:k) {
+    if(all.equal(clusters[[clusts]][[2]],clusterindices[[clusts]]) == TRUE) { #checks to see if we should terminate
+      numcheck <- numcheck + 1
+    }
+    if(numcheck == k) {
+      check <- FALSE
+    }
+      clusterindices[[clusts]] <- clusters[[clusts]][[2]] #update points
+      clusters[[clusts]][[2]] <- c(0) #initialize
+      clusters[[clusts]][[3]] <- list() #initialize
+  }
+  #assign to clusters
+  for(j in 1:n) {
+    series <- frame[,j]
+    norms <- c()
+    for(centers in 1:k) {
+      norm <- norm((clusters[[centers]][[1]] - frame[,j]),"2")
+      norms <- c(norms,norm)
+    }
+    
+    cent <- which(norms==min(norms)) #finds closes center to point
+    clusters[[cent]][[2]] <- c(clusters[[cent]][[2]],j)
+    clusters[[cent]][[3]][[(length(clusters[[cent]][[3]])+1)]] <- series #adds actual points
+    }
+    for(re in 1:k) {
+      clusters[[re]][[2]] <- clusters[[re]][[2]][-1] #remove initial value set
+    }
+  
+  #update centers
+  for(z in 1:k) {
+      if(length(clusters[[z]][[3]]) >= 1) { #checks if there are more than 0 points in the cluster
+        listframe <- data.frame(clusters[[z]][[3]][[1]])
+        if(length(clusters[[z]][[3]]) > 1) {
+        try(for(listindex in 2:length(clusters[[z]][[3]])) {
+          listframe <- cbind(listframe,clusters[[z]][[3]][[listindex]])
+        })
+        }
+        if(length(listframe) > 0) { 
+          clusters[[z]][[1]] <- rowMeans(listframe) #calculate the mean of all the points in cluster to get new centers
+        }
+       }
+    }
+    count <- count + 1
+    }
+  return(clusters)
+}
+
+
+```
+
+###Analysis
+run 1000 times and see if our results prove that we can distinguish a series as a stock or a cryptocurrency, picking the most frequent combination of points in the clusters as a good choice to cluster the series
+```{r} 
+
+analyze_k_means <- function(sds,iterations) {
+datasds <- data.frame(sds[1]) #standard deviations
+for(lo in 2:length(sds)) {
+  datasds <- cbind(datasds,sds[lo])
+}
+count <- 1
+listofcomb <- list()
+numberofcomb <- c()
+while(count <= iterations) {
+  zeroes <- rep(0,11)
+  seqelev <- c(1:11)
+  clustersret <- k_means(datasds,2,0,max(datasds)) #0 to maximum standard deviation value, use 2 clusters for stocks and cryptos.
+  if(length(listofcomb) == 0) { #adds first cluster combination
+    listofcomb[[(length(listofcomb)+1)]] <- clustersret[[1]][[2]]
+    for(newi in 1:length(clustersret[[1]][[2]])) {
+      zeroes[clustersret[[1]][[2]][newi]] <- clustersret[[1]][[2]][newi]
+    }
+    newvec <- seqelev - zeroes #finds the combination for the second cluster
+    newvec <- newvec[newvec > 0] #filters the positive values for the combination of the second cluster
+    listofcomb[[(length(listofcomb)+1)]] <- newvec
+    numberofcomb <- c(0)
+    numberofcomb <- c(numberofcomb,0)
+  }
+  zeroes <- rep(0,11)
+  seqelev <- c(1:11)
+  checkifin <- lapply(listofcomb,identical,clustersret[[1]][[2]]) #checks if the combination is already in the list of known combinations
+  if((TRUE %in% checkifin) == FALSE) { #if its not in the list, we add it and its associated combination fop second cluster
+    listofcomb[[(length(listofcomb)+1)]] <- clustersret[[1]][[2]]
+    for(newi in 1:length(clustersret[[1]][[2]])) {
+      zeroes[clustersret[[1]][[2]][newi]] <- clustersret[[1]][[2]][newi]
+    }
+    newvec <- seqelev - zeroes
+    newvec <- newvec[newvec > 0]
+    listofcomb[[(length(listofcomb)+1)]] <- newvec
+    numberofcomb <- c(numberofcomb,1)
+    numberofcomb <- c(numberofcomb,0)
+  }
+  else if ((TRUE %in% checkifin) == TRUE) { #if its in the list, we increment to add "another occurance"
+    checkindex <- which(checkifin==TRUE)
+    numberofcomb[checkindex] <- numberofcomb[checkindex]+1
+  }
+  count <- count + 1
+}
+combinations <- do.call(rbind, Map(data.frame, combinations=as.character(listofcomb), number=numberofcomb)) #put in dataframe
+return(combinations)
+}
+combinations <- analyze_k_means(standarddevs,1000)
+
+splitcomb <- split(combinations$number,ceiling(seq_along(combinations$number)/2)) #get values for each combination of cluster 1 & 2
+sumsnumber <- c()
+for(combs in 1:length(splitcomb)) {
+  sumsnumber <- c(sumsnumber,sum(splitcomb[[combs]])) #get the total occurances
+}
+sumsnumber <- sumsnumber/sum(sumsnumber) #proportions
+othercomb <- combinations[seq_along(combinations)%%2==0,] #get combinations for cluster 2s
+othercomb <- as.character(othercomb$combinations)
+newcombs <- combinations[seq_along(combinations)%%2>0,] #get combinations for cluster 1s
+newcombs$combinations <- as.character(newcombs$combinations)
+newcombs$number <- othercomb
+newcombs <- cbind(newcombs,sumsnumber)
+names(newcombs) <- c("combination_first_cluster", "combination_second_cluster","proportion_of_combinations")
+newcombs #look at combinations and frequencies
+highestfrequency <- newcombs[newcombs$proportion_of_combinations==max(newcombs$proportion_of_combinations),]
+for(colnam in 1:2){ #get the actual names and get the highest frequency
+freqnames <- as.character(highestfrequency[,colnam][1])
+freqnames <- gsub("c\\(","",freqnames)
+freqnames <- gsub("\\)","",freqnames)
+freqnames <- gsub("\"","",freqnames)
+freqnames <- noquote(freqnames)
+freqnames <- strsplit(freqnames,",")
+freqnames <- as.numeric(freqnames[[1]])
+strnames <- c()
+for(names in 1:length(freqnames)) {
+  strnames <- c(strnames, fullnames[freqnames[names]])
+}
+strnames <- as.character(paste0(strnames,collapse = ", "))
+highestfrequency[,colnam][1] <- strnames #asign the names
+}
+
+highestfrequency#this is the most common combination of clusters with the most occurrances, which shouldn't be surprising because all of the stocks are grouped together. Bitcoin is also grouped with them because compared to the other currencies, its not very volatile, even though it is to the stocks.
+```
+
+
+
+
